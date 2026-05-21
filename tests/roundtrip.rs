@@ -188,3 +188,28 @@ async fn bind_removes_stale_socket_file() {
     // bind() should remove the stale file and succeed.
     let (_pin, _inj) = DatagramInputPin::bind(&path, false).unwrap();
 }
+
+#[async_std::test]
+async fn bind_refuses_to_clobber_a_live_peer() {
+    let path = temp_path("live_peer");
+    // A live bound socket — held for the duration of the test.
+    let _live = UnixDatagram::bind(&path).unwrap();
+
+    match DatagramInputPin::bind(&path, false) {
+        Ok(_) => panic!("bind must refuse to displace a live owner"),
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse),
+    }
+}
+
+#[async_std::test]
+async fn unknown_wire_bytes_do_not_change_state() {
+    let path = temp_path("unknown_byte");
+    let (mut input, _inj) = DatagramInputPin::bind(&path, false).unwrap();
+
+    // Send a byte that is neither b'0' nor b'1'.
+    let peer = UnixDatagram::unbound().unwrap();
+    peer.send_to(b"X", &path).unwrap();
+
+    async_std::task::sleep(Duration::from_millis(20)).await;
+    assert!(input.is_low().unwrap(), "unknown byte must not flip state");
+}

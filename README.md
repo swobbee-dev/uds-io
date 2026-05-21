@@ -15,14 +15,14 @@ The crate exists for **software-in-the-loop (SIL) simulation**: code written aga
 
 ### Wire format
 
-One byte per datagram:
+One ASCII byte per datagram. Strictly enforced — any other value is logged at `trace` and dropped:
 
 | Byte    | Meaning |
 | ------- | ------- |
-| `0x00`  | LOW     |
-| any other | HIGH  |
+| `b'0'`  | LOW     |
+| `b'1'`  | HIGH    |
 
-That's it. Any process that can `send(2)` a byte to a Unix datagram socket can drive an input pin.
+Strict acceptance keeps the wire interpretable by eyeball (`socat`, `nc -uU`) and prevents stray traffic on a shared path from being silently misread as a level change. Any process that can `send(2)` an ASCII `0` or `1` to a Unix datagram socket can drive an input pin.
 
 ## Runtime
 
@@ -61,6 +61,7 @@ A few things worth knowing, because they're not obvious from the type signatures
 - **Level reads do drain.** `is_high` / `is_low` drain any queued datagrams first, so they always reflect the most recent state in the kernel buffer.
 - **Injector channel is unbounded.** `InputPinInjector::inject` is non-blocking and never applies backpressure.
 - **A `DatagramInputPin` is not safe to share across tasks without external synchronization** — it mutates internal state from both the drain and recv paths.
+- **`bind` refuses to clobber a live peer.** A stale socket file left behind by a crashed process is reclaimed automatically, but if another live process is bound to the path, `bind` fails with `AddrInUse` rather than ripping the socket out from under it. The probe (`connect(2)` to the path: `ECONNREFUSED` means stale, `Ok` means live) is the only way to distinguish the two cases.
 
 ## Building / testing
 

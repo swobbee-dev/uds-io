@@ -40,20 +40,17 @@ impl DatagramInputPin {
     /// Bind a Unix datagram socket at `path` and return a pin reading from it
     /// plus a cloneable injector handle.
     ///
-    /// A stale socket file at `path` is removed first. Parent directories are
-    /// created if missing.
+    /// A stale socket file from a crashed prior run (file present, no live
+    /// owner) is reclaimed; a live peer already bound to the path is *not*
+    /// displaced — the call fails with `AddrInUse` rather than ripping the
+    /// socket out from under it. See [`bind_or_reclaim`] for the probe logic.
+    /// Parent directories are created if missing.
     pub fn bind(path: impl AsRef<Path>, initial: bool) -> io::Result<(Self, InputPinInjector)> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        let raw = UnixDatagram::bind(path)?;
-        let socket = Async::new(raw)?;
+        let socket = bind_or_reclaim(path)?;
         let (tx, rx) = async_channel::unbounded();
         Ok((
             Self {
@@ -80,13 +77,19 @@ impl DatagramInputPin {
     }
 
     /// Drain any queued datagrams and injected overrides into `self.state`.
-    /// Non-blocking — returns once both sources would block.
+    /// Non-blocking — returns once both sources would block. Bytes that
+    /// don't match the strict wire format are logged at trace and skipped.
     fn drain_pending(&mut self) {
         if let Some(sock) = &self.socket {
             let mut buf = [0u8; 1];
             loop {
                 match sock.get_ref().recv(&mut buf) {
-                    Ok(1) => self.state = byte_to_bool(buf[0]),
+                    Ok(1) => match byte_to_bool(buf[0]) {
+                        Some(v) => self.state = v,
+                        None => {
+                            tracing::trace!(byte = buf[0], "uds-io: ignoring unknown wire byte")
+                        }
+                    },
                     Ok(_) => continue,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(_) => break,
@@ -99,7 +102,9 @@ impl DatagramInputPin {
     }
 
     /// Wait for either the socket or the override channel to yield one value
-    /// and apply it to `self.state`.
+    /// and apply it to `self.state`. Bytes that don't match the strict wire
+    /// format do not update state; a Wait future awaiting an edge will simply
+    /// loop and re-await on the next datagram.
     async fn recv_one(&mut self) {
         let new_state: Option<bool> = {
             let socket = self.socket.as_ref();
@@ -109,11 +114,14 @@ impl DatagramInputPin {
                     let socket_fut = async {
                         let mut buf = [0u8; 1];
                         let n = sock.read_with(|s| s.recv(&mut buf)).await.ok()?;
-                        if n == 1 {
-                            Some(byte_to_bool(buf[0]))
-                        } else {
-                            None
+                        if n != 1 {
+                            return None;
                         }
+                        let parsed = byte_to_bool(buf[0]);
+                        if parsed.is_none() {
+                            tracing::trace!(byte = buf[0], "uds-io: ignoring unknown wire byte");
+                        }
+                        parsed
                     };
                     let override_fut = async { override_rx.recv().await.ok() };
                     futures_lite::future::or(socket_fut, override_fut).await
@@ -208,5 +216,41 @@ impl Wait for DatagramInputPin {
                 return Ok(());
             }
         }
+    }
+}
+
+/// Binds a UNIX datagram socket at `path`, reclaiming a stale file from a
+/// crashed prior run while refusing to clobber a live peer.
+///
+/// On `EADDRINUSE`, probes the path via `connect()`: a `SOCK_DGRAM` UNIX
+/// socket returns `ECONNREFUSED` when the file exists but no process is
+/// bound (the crash case) and succeeds when a process is bound. The probe
+/// is the only way to distinguish the two — `path.exists()` alone tells us
+/// nothing about liveness, and an unconditional `remove_file` would
+/// silently steal a concurrent process's socket. The bind retry after
+/// `remove_file` is racy against another process binding in between, but
+/// losing that race surfaces as a clean `AddrInUse` rather than data
+/// corruption.
+fn bind_or_reclaim(path: &Path) -> io::Result<Async<UnixDatagram>> {
+    match Async::<UnixDatagram>::bind(path) {
+        Ok(s) => return Ok(s),
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {}
+        Err(e) => return Err(e),
+    }
+
+    let probe = UnixDatagram::unbound()?;
+    match probe.connect(path) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "UDS path {} is bound by another live process",
+                path.display()
+            ),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+            std::fs::remove_file(path)?;
+            Async::<UnixDatagram>::bind(path)
+        }
+        Err(e) => Err(e),
     }
 }
