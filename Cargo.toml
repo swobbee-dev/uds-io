@@ -1,0 +1,18 @@
+[package]
+name = "uds-io"
+version = "0.1.0"
+edition = "2024"
+description = "Unix datagram socket-backed digital pins implementing embedded-hal-async traits"
+license = "MIT"
+
+[dependencies]
+embedded-hal = "1.0"
+embedded-hal-async = "1.0"
+async-io = "2"
+async-channel = "2"
+futures-lite = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+async-std = { version = "1", features = ["attributes"] }
