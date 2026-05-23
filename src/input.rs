@@ -22,9 +22,14 @@ use crate::byte_to_bool;
 ///
 /// The pin itself owns the socket; no background task is spawned. The pin's
 /// futures must be polled by some executor for it to make progress.
+///
+/// Dropping every outstanding [`InputPinInjector`] is fine — the channel
+/// stays open for the pin's lifetime.
 pub struct DatagramInputPin {
     socket: Option<Async<UnixDatagram>>,
     override_rx: async_channel::Receiver<bool>,
+    /// Keeps `override_rx` open for the pin's lifetime.
+    _override_keepalive: async_channel::Sender<bool>,
     state: bool,
 }
 
@@ -56,6 +61,7 @@ impl DatagramInputPin {
             Self {
                 socket: Some(socket),
                 override_rx: rx,
+                _override_keepalive: tx.clone(),
                 state: initial,
             },
             InputPinInjector { override_tx: tx },
@@ -70,6 +76,7 @@ impl DatagramInputPin {
             Self {
                 socket: None,
                 override_rx: rx,
+                _override_keepalive: tx.clone(),
                 state: initial,
             },
             InputPinInjector { override_tx: tx },

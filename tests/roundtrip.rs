@@ -202,6 +202,31 @@ async fn bind_refuses_to_clobber_a_live_peer() {
 }
 
 #[async_std::test]
+async fn dropping_all_injectors_does_not_spin_wait_future() {
+    let (mut input, injector) = DatagramInputPin::unbound(false);
+    drop(injector);
+
+    let result = async_std::future::timeout(Duration::from_millis(100), input.wait_for_high()).await;
+    assert!(result.is_err(), "wait_for_high resolved with no event source");
+}
+
+#[async_std::test]
+async fn pin_still_reacts_to_socket_after_injector_drop() {
+    let path = temp_path("post_inj_drop");
+    let (mut input, injector) = DatagramInputPin::bind(&path, false).unwrap();
+    let mut output = DatagramOutputPin::connect(path.clone(), false).unwrap();
+    drop(injector);
+
+    output.set_high().unwrap();
+
+    async_std::future::timeout(Duration::from_secs(1), input.wait_for_high())
+        .await
+        .expect("wait_for_high timed out after injector drop")
+        .unwrap();
+    assert!(input.is_high().unwrap());
+}
+
+#[async_std::test]
 async fn unknown_wire_bytes_do_not_change_state() {
     let path = temp_path("unknown_byte");
     let (mut input, _inj) = DatagramInputPin::bind(&path, false).unwrap();
