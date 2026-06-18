@@ -1,5 +1,7 @@
-//! `DatagramInputPin`: a `UnixDatagram`-backed input pin implementing
-//! `embedded_hal::digital::InputPin` and `embedded_hal_async::digital::Wait`.
+//! `DatagramInput<C>`: a `UnixDatagram`-backed input pin generic over a
+//! [`Codec`]. The bool-codec specialization implements
+//! `embedded_hal::digital::InputPin` and `embedded_hal_async::digital::Wait`;
+//! the analog one exposes `value()` / `recv()`.
 
 use std::convert::Infallible;
 use std::io;
@@ -10,38 +12,46 @@ use async_io::Async;
 use embedded_hal::digital::{ErrorType, InputPin};
 use embedded_hal_async::digital::Wait;
 
-use crate::byte_to_bool;
+use crate::{BoolCodec, Codec, MAX_DATAGRAM};
 
 /// An input pin whose state is driven by:
 /// - Datagrams received on a bound Unix socket, and
-/// - Direct state injection via an [`InputPinInjector`] handle.
+/// - Direct value injection via an [`InputInjector`] handle.
 ///
 /// Both paths funnel into the same internal state. The pin caches the most
-/// recent state and exposes it via `is_high` / `is_low`; awaiting any of the
-/// `Wait` futures resumes when new state arrives.
+/// recent value and exposes it via `value()` (and, for the bool codec,
+/// `is_high` / `is_low`); awaiting `recv()` (or any `Wait` future) resumes when
+/// new state arrives.
 ///
 /// The pin itself owns the socket; no background task is spawned. The pin's
 /// futures must be polled by some executor for it to make progress.
 ///
-/// Dropping every outstanding [`InputPinInjector`] is fine — the channel
-/// stays open for the pin's lifetime.
-pub struct DatagramInputPin {
+/// Dropping every outstanding [`InputInjector`] is fine — the channel stays
+/// open for the pin's lifetime.
+pub struct DatagramInput<C: Codec> {
     socket: Option<Async<UnixDatagram>>,
-    override_rx: async_channel::Receiver<bool>,
+    override_rx: async_channel::Receiver<C::Value>,
     /// Keeps `override_rx` open for the pin's lifetime.
-    _override_keepalive: async_channel::Sender<bool>,
-    state: bool,
+    _override_keepalive: async_channel::Sender<C::Value>,
+    state: C::Value,
 }
 
-/// Handle for directly injecting a state value into a [`DatagramInputPin`],
-/// bypassing the socket path. Useful for tests and for in-process fault
-/// injection (e.g. from a gRPC service).
-#[derive(Clone)]
-pub struct InputPinInjector {
-    override_tx: async_channel::Sender<bool>,
+/// Handle for directly injecting a value into a [`DatagramInput`], bypassing the
+/// socket path. Useful for tests and in-process fault injection (e.g. from a
+/// gRPC service).
+pub struct InputInjector<C: Codec> {
+    override_tx: async_channel::Sender<C::Value>,
 }
 
-impl DatagramInputPin {
+impl<C: Codec> Clone for InputInjector<C> {
+    fn clone(&self) -> Self {
+        Self {
+            override_tx: self.override_tx.clone(),
+        }
+    }
+}
+
+impl<C: Codec> DatagramInput<C> {
     /// Bind a Unix datagram socket at `path` and return a pin reading from it
     /// plus a cloneable injector handle.
     ///
@@ -50,7 +60,7 @@ impl DatagramInputPin {
     /// displaced — the call fails with `AddrInUse` rather than ripping the
     /// socket out from under it. See [`bind_or_reclaim`] for the probe logic.
     /// Parent directories are created if missing.
-    pub fn bind(path: impl AsRef<Path>, initial: bool) -> io::Result<(Self, InputPinInjector)> {
+    pub fn bind(path: impl AsRef<Path>, initial: C::Value) -> io::Result<(Self, InputInjector<C>)> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -64,13 +74,13 @@ impl DatagramInputPin {
                 _override_keepalive: tx.clone(),
                 state: initial,
             },
-            InputPinInjector { override_tx: tx },
+            InputInjector { override_tx: tx },
         ))
     }
 
     /// Construct a pin with no socket: state is driven only by the injector.
     /// Useful for unit tests that don't need a real socket peer.
-    pub fn unbound(initial: bool) -> (Self, InputPinInjector) {
+    pub fn unbound(initial: C::Value) -> (Self, InputInjector<C>) {
         let (tx, rx) = async_channel::unbounded();
         (
             Self {
@@ -79,25 +89,36 @@ impl DatagramInputPin {
                 _override_keepalive: tx.clone(),
                 state: initial,
             },
-            InputPinInjector { override_tx: tx },
+            InputInjector { override_tx: tx },
         )
     }
 
+    /// Latest cached value, after draining any queued datagrams / injections.
+    pub fn value(&mut self) -> C::Value {
+        self.drain_pending();
+        self.state
+    }
+
+    /// Await the next datagram or injection, then return the (now latest) value.
+    pub async fn recv(&mut self) -> C::Value {
+        self.recv_one().await;
+        self.state
+    }
+
     /// Drain any queued datagrams and injected overrides into `self.state`.
-    /// Non-blocking — returns once both sources would block. Bytes that
-    /// don't match the strict wire format are logged at trace and skipped.
+    /// Non-blocking — returns once both sources would block. Datagrams that
+    /// don't match the codec's wire format are logged at trace and skipped.
     fn drain_pending(&mut self) {
         if let Some(sock) = &self.socket {
-            let mut buf = [0u8; 1];
+            let mut buf = [0u8; MAX_DATAGRAM];
             loop {
                 match sock.get_ref().recv(&mut buf) {
-                    Ok(1) => match byte_to_bool(buf[0]) {
+                    Ok(n) => match C::decode(&buf[..n]) {
                         Some(v) => self.state = v,
                         None => {
-                            tracing::trace!(byte = buf[0], "uds-io: ignoring unknown wire byte")
+                            tracing::trace!(len = n, "uds-io: ignoring unparseable datagram")
                         }
                     },
-                    Ok(_) => continue,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(_) => break,
                 }
@@ -109,24 +130,21 @@ impl DatagramInputPin {
     }
 
     /// Wait for either the socket or the override channel to yield one value
-    /// and apply it to `self.state`. Bytes that don't match the strict wire
-    /// format do not update state; a Wait future awaiting an edge will simply
-    /// loop and re-await on the next datagram.
+    /// and apply it to `self.state`. Datagrams that don't match the codec's
+    /// wire format do not update state; a caller looping for an edge will
+    /// simply re-await on the next datagram.
     async fn recv_one(&mut self) {
-        let new_state: Option<bool> = {
+        let new_state: Option<C::Value> = {
             let socket = self.socket.as_ref();
             let override_rx = &self.override_rx;
             match socket {
                 Some(sock) => {
                     let socket_fut = async {
-                        let mut buf = [0u8; 1];
+                        let mut buf = [0u8; MAX_DATAGRAM];
                         let n = sock.read_with(|s| s.recv(&mut buf)).await.ok()?;
-                        if n != 1 {
-                            return None;
-                        }
-                        let parsed = byte_to_bool(buf[0]);
+                        let parsed = C::decode(&buf[..n]);
                         if parsed.is_none() {
-                            tracing::trace!(byte = buf[0], "uds-io: ignoring unknown wire byte");
+                            tracing::trace!(len = n, "uds-io: ignoring unparseable datagram");
                         }
                         parsed
                     };
@@ -142,33 +160,33 @@ impl DatagramInputPin {
     }
 }
 
-impl InputPinInjector {
-    /// Inject a state value. Non-blocking; uses an unbounded channel so this
-    /// never fails under normal conditions.
-    pub fn inject(&self, value: bool) {
-        if let Err(e) = self.override_tx.try_send(value) {
-            tracing::warn!(?e, "uds-io: injector try_send failed");
+impl<C: Codec> InputInjector<C> {
+    /// Inject a value. Non-blocking; uses an unbounded channel so this never
+    /// fails under normal conditions.
+    pub fn inject(&self, value: C::Value) {
+        if self.override_tx.try_send(value).is_err() {
+            tracing::warn!("uds-io: injector try_send failed");
         }
     }
 }
 
-impl ErrorType for DatagramInputPin {
+// --- Digital (bool-codec) specialization: the embedded-hal pin traits ---
+
+impl ErrorType for DatagramInput<BoolCodec> {
     type Error = Infallible;
 }
 
-impl InputPin for DatagramInputPin {
+impl InputPin for DatagramInput<BoolCodec> {
     fn is_high(&mut self) -> Result<bool, Self::Error> {
-        self.drain_pending();
-        Ok(self.state)
+        Ok(self.value())
     }
 
     fn is_low(&mut self) -> Result<bool, Self::Error> {
-        self.drain_pending();
-        Ok(!self.state)
+        Ok(!self.value())
     }
 }
 
-impl Wait for DatagramInputPin {
+impl Wait for DatagramInput<BoolCodec> {
     async fn wait_for_high(&mut self) -> Result<(), Self::Error> {
         loop {
             self.drain_pending();
@@ -192,8 +210,7 @@ impl Wait for DatagramInputPin {
     async fn wait_for_rising_edge(&mut self) -> Result<(), Self::Error> {
         // Don't drain up front: doing so would collapse a queued [low, high]
         // pair into a single "state is high" reading and we'd miss the edge.
-        // Instead, walk events one-at-a-time looking for the false->true
-        // transition.
+        // Instead, walk events one-at-a-time looking for the false->true edge.
         let mut prev = self.state;
         loop {
             self.recv_one().await;
@@ -230,14 +247,13 @@ impl Wait for DatagramInputPin {
 /// crashed prior run while refusing to clobber a live peer.
 ///
 /// On `EADDRINUSE`, probes the path via `connect()`: a `SOCK_DGRAM` UNIX
-/// socket returns `ECONNREFUSED` when the file exists but no process is
-/// bound (the crash case) and succeeds when a process is bound. The probe
-/// is the only way to distinguish the two — `path.exists()` alone tells us
-/// nothing about liveness, and an unconditional `remove_file` would
-/// silently steal a concurrent process's socket. The bind retry after
-/// `remove_file` is racy against another process binding in between, but
-/// losing that race surfaces as a clean `AddrInUse` rather than data
-/// corruption.
+/// socket returns `ECONNREFUSED` when the file exists but no process is bound
+/// (the crash case) and succeeds when a process is bound. The probe is the only
+/// way to distinguish the two — `path.exists()` alone tells us nothing about
+/// liveness, and an unconditional `remove_file` would silently steal a
+/// concurrent process's socket. The bind retry after `remove_file` is racy
+/// against another process binding in between, but losing that race surfaces as
+/// a clean `AddrInUse` rather than data corruption.
 fn bind_or_reclaim(path: &Path) -> io::Result<Async<UnixDatagram>> {
     match Async::<UnixDatagram>::bind(path) {
         Ok(s) => return Ok(s),

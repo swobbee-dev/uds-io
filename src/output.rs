@@ -1,5 +1,7 @@
-//! `DatagramOutputPin`: a `UnixDatagram`-backed output pin implementing
-//! `embedded_hal::digital::OutputPin` and `embedded_hal::digital::StatefulOutputPin`.
+//! `DatagramOutput<C>`: a `UnixDatagram`-backed output pin generic over a
+//! [`Codec`]. The bool-codec specialization implements
+//! `embedded_hal::digital::OutputPin` / `StatefulOutputPin`; the analog one
+//! exposes `set()` / `get()`.
 
 use std::convert::Infallible;
 use std::io;
@@ -8,25 +10,25 @@ use std::path::PathBuf;
 
 use embedded_hal::digital::{ErrorType, OutputPin, StatefulOutputPin};
 
-use crate::bool_to_byte;
+use crate::{BoolCodec, Codec, MAX_DATAGRAM};
 
-/// An output pin that sends a single byte per state change to a peer Unix
+/// An output pin that sends one datagram per state change to a peer Unix
 /// datagram socket path.
 ///
 /// Sends are non-blocking: if the peer is not bound (`ENOENT`) or its receive
-/// buffer is full (`EAGAIN` / `EWOULDBLOCK`), the send is dropped and logged
-/// at trace level. This matches GPIO semantics — outputs don't "fail" because
+/// buffer is full (`EAGAIN` / `EWOULDBLOCK`), the send is dropped and logged at
+/// trace level. This matches GPIO semantics — outputs don't "fail" because
 /// nobody is listening.
-pub struct DatagramOutputPin {
+pub struct DatagramOutput<C: Codec> {
     socket: UnixDatagram,
     peer: PathBuf,
-    state: bool,
+    state: C::Value,
 }
 
-impl DatagramOutputPin {
+impl<C: Codec> DatagramOutput<C> {
     /// Create an unbound non-blocking datagram socket targeted at `peer_path`.
     /// Emits the initial state immediately (best-effort).
-    pub fn connect(peer_path: impl Into<PathBuf>, initial: bool) -> io::Result<Self> {
+    pub fn connect(peer_path: impl Into<PathBuf>, initial: C::Value) -> io::Result<Self> {
         let socket = UnixDatagram::unbound()?;
         socket.set_nonblocking(true)?;
         let pin = Self {
@@ -38,39 +40,49 @@ impl DatagramOutputPin {
         Ok(pin)
     }
 
+    /// Set the pin's value and emit it (best-effort).
+    pub fn set(&mut self, value: C::Value) {
+        self.state = value;
+        self.send();
+    }
+
+    /// The last value set on this pin.
+    pub fn get(&self) -> C::Value {
+        self.state
+    }
+
     fn send(&self) {
-        match self.socket.send_to(&[bool_to_byte(self.state)], &self.peer) {
-            Ok(_) => {}
-            Err(e) => {
-                tracing::trace!(
-                    error = %e,
-                    peer = %self.peer.display(),
-                    "uds-io: send_to failed (peer not bound / would block?)",
-                );
-            }
+        let mut buf = [0u8; MAX_DATAGRAM];
+        let n = C::encode(self.state, &mut buf);
+        if let Err(e) = self.socket.send_to(&buf[..n], &self.peer) {
+            tracing::trace!(
+                error = %e,
+                peer = %self.peer.display(),
+                "uds-io: send_to failed (peer not bound / would block?)",
+            );
         }
     }
 }
 
-impl ErrorType for DatagramOutputPin {
+// --- Digital (bool-codec) specialization: the embedded-hal pin traits ---
+
+impl ErrorType for DatagramOutput<BoolCodec> {
     type Error = Infallible;
 }
 
-impl OutputPin for DatagramOutputPin {
+impl OutputPin for DatagramOutput<BoolCodec> {
     fn set_high(&mut self) -> Result<(), Self::Error> {
-        self.state = true;
-        self.send();
+        self.set(true);
         Ok(())
     }
 
     fn set_low(&mut self) -> Result<(), Self::Error> {
-        self.state = false;
-        self.send();
+        self.set(false);
         Ok(())
     }
 }
 
-impl StatefulOutputPin for DatagramOutputPin {
+impl StatefulOutputPin for DatagramOutput<BoolCodec> {
     fn is_set_high(&mut self) -> Result<bool, Self::Error> {
         Ok(self.state)
     }
