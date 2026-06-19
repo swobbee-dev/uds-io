@@ -15,10 +15,9 @@ use crate::{BoolCodec, Codec, MAX_DATAGRAM};
 /// An output pin that sends one datagram per state change to a peer Unix
 /// datagram socket path.
 ///
-/// Sends are non-blocking: if the peer is not bound (`ENOENT`) or its receive
-/// buffer is full (`EAGAIN` / `EWOULDBLOCK`), the send is dropped and logged at
-/// trace level. This matches GPIO semantics — outputs don't "fail" because
-/// nobody is listening.
+/// Sends are non-blocking. `set` is best-effort (GPIO semantics — an output
+/// doesn't fail because nobody is listening); `set_delivered` surfaces the
+/// `send_to` result so a caller can retry until a late-binding peer is reachable.
 pub struct DatagramOutput<C: Codec> {
     socket: UnixDatagram,
     peer: PathBuf,
@@ -36,14 +35,22 @@ impl<C: Codec> DatagramOutput<C> {
             peer: peer_path.into(),
             state: initial,
         };
-        pin.send();
+        let _ = pin.send();
         Ok(pin)
     }
 
     /// Set the pin's value and emit it (best-effort).
     pub fn set(&mut self, value: C::Value) {
         self.state = value;
-        self.send();
+        let _ = self.send();
+    }
+
+    /// Set the pin's value and emit it, returning whether the datagram was
+    /// delivered. `Err` (typically `ENOENT`) means the peer has not bound its
+    /// socket yet — a caller that needs the value to land can retry.
+    pub fn set_delivered(&mut self, value: C::Value) -> io::Result<()> {
+        self.state = value;
+        self.send()
     }
 
     /// The last value set on this pin.
@@ -51,16 +58,10 @@ impl<C: Codec> DatagramOutput<C> {
         self.state
     }
 
-    fn send(&self) {
+    fn send(&self) -> io::Result<()> {
         let mut buf = [0u8; MAX_DATAGRAM];
         let n = C::encode(self.state, &mut buf);
-        if let Err(e) = self.socket.send_to(&buf[..n], &self.peer) {
-            tracing::trace!(
-                error = %e,
-                peer = %self.peer.display(),
-                "uds-io: send_to failed (peer not bound / would block?)",
-            );
-        }
+        self.socket.send_to(&buf[..n], &self.peer).map(|_| ())
     }
 }
 
